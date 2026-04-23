@@ -124,7 +124,6 @@ class Gemma4Attention(nn.Module):
         
         return outputs
 
-# TODO implement Gemma4FlashAttention2, notice that the attention pattern is different from Gemma2/3, we need to apply the rotation after the q/k/v projections and before the attention computation, and we need to use the same rotation for q/k/v in the same layer. We can also share the rotation matrices across layers to save memory, but we will implement it with separate rotation matrices for each layer first.
 class Gemma4FlashAttention2(Gemma4Attention):
     def __init__(self, config: Gemma4Config, layer_idx: Optional[int] = None):
         super().__init__(config=config, layer_idx=layer_idx)
