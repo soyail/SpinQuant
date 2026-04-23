@@ -1,11 +1,14 @@
-import math
 from typing import Optional
 
 import torch
 import torch.nn as nn
 from train_utils.quant_linear import QuantizeLinear
+from transformers.activations import ACT2FN
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
+from transformers.utils import logging
 from vllm.model_executor.layers.layernorm import RMSNorm
+
+logger = logging.get_logger(__name__)
 
 class Gemma4MLP(nn.Module):
     def __init__(self, config):
@@ -16,6 +19,7 @@ class Gemma4MLP(nn.Module):
         self.gate_proj = QuantizeLinear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.up_proj = QuantizeLinear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = QuantizeLinear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_activation]
 
     def forward(self, x, R1):
         down_proj = self.down_proj(
@@ -69,12 +73,7 @@ class Gemma4Attention(nn.Module):
         self.v_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.R2 = None
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            max_position=max_position_embeddings,
-            rope_parameters=rope_parameters,
-            is_neox_style=True,
-        )
+        self.rotary_emb = None
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, R1=None):
         batch_size, seq_length, _ = hidden_states.size()
@@ -100,12 +99,12 @@ class Gemma4Attention(nn.Module):
             key = self.rotary_emb(key, seq_len=seq_length)
 
         # compute attention scores
-        attn_weights = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(query, key.transpose(-2, -1))
 
         if attention_mask is not None:
             attn_weights += attention_mask
 
-        attn_weights = torch.nn.Softmax(dim=-1)(attn_weights)
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
 
         # compute attention output
         attn_output = torch.matmul(attn_weights, value)
@@ -168,11 +167,11 @@ class Gemma4FlashAttention2(Gemma4Attention):
             query = self.rotary_emb(query, seq_len=seq_length)
             key = self.rotary_emb(key, seq_len=seq_length)
 
-        attn_weights = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(query, key.transpose(-2, -1))
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
 
-        attn_weights = torch.nn.Softmax(dim=-1)(attn_weights)
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
         attn_output = torch.matmul(attn_weights, value)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.hidden_size)
         attn_output = self.o_proj(attn_output, R1, R2=self.R2.weight, transpose=True)
