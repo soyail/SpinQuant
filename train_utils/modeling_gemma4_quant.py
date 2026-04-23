@@ -19,7 +19,8 @@ class Gemma4MLP(nn.Module):
         self.gate_proj = QuantizeLinear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.up_proj = QuantizeLinear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = QuantizeLinear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
-        self.act_fn = ACT2FN[config.hidden_activation]
+        activation_name = getattr(config, "hidden_activation", "gelu")
+        self.act_fn = ACT2FN[activation_name]
 
     def forward(self, x, R1):
         down_proj = self.down_proj(
@@ -49,6 +50,7 @@ class Gemma4Attention(nn.Module):
         # Unlike Gemma2/3, query_pre_attn_scalar is NOT used here;
         # Q/K norms with learnable weights handle scaling implicitly.
         self.scaling = 1.0
+        self.attn_scale = self.scaling * (self.head_dim ** -0.5)
 
         self.q_proj = QuantizeLinear(
             self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
@@ -77,11 +79,12 @@ class Gemma4Attention(nn.Module):
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, R1=None):
         batch_size, seq_length, _ = hidden_states.size()
+        r2_weight = self.R2.weight if self.R2 is not None else None
 
         # project to q/k/v
         query = self.q_proj(hidden_states, R1)
         key = self.k_proj(hidden_states, R1)
-        value = self.v_proj(hidden_states, R1, R2=self.R2.weight)
+        value = self.v_proj(hidden_states, R1, R2=r2_weight)
 
         # reshape to (batch_size, num_heads, seq_length, head_dim)
         query = query.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
@@ -89,8 +92,8 @@ class Gemma4Attention(nn.Module):
         value = value.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         # apply RMSNorm and scaling
-        query = self.q_norm(query) * (self.scaling * (self.head_dim ** -0.5))
-        key = self.k_norm(key) * (self.scaling * (self.head_dim ** -0.5))
+        query = self.q_norm(query) * self.attn_scale
+        key = self.k_norm(key) * self.attn_scale
         value = self.v_norm(value)
 
         # apply rotary embeddings
@@ -113,7 +116,7 @@ class Gemma4Attention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.hidden_size)
 
         # project output
-        attn_output = self.o_proj(attn_output, R1, R2=self.R2.weight, transpose=True)
+        attn_output = self.o_proj(attn_output, R1, R2=r2_weight, transpose=True)
 
         outputs = (attn_output,)
         if output_attentions:
@@ -145,10 +148,11 @@ class Gemma4FlashAttention2(Gemma4Attention):
         R1=None,
     ):
         batch_size, seq_length, _ = hidden_states.size()
+        r2_weight = self.R2.weight if self.R2 is not None else None
 
         query = self.q_proj(hidden_states, R1)
         key = self.k_proj(hidden_states, R1)
-        value = self.v_proj(hidden_states, R1, R2=self.R2.weight)
+        value = self.v_proj(hidden_states, R1, R2=r2_weight)
 
         query = query.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
         key = key.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -159,8 +163,8 @@ class Gemma4FlashAttention2(Gemma4Attention):
         key = self._apply_shared_qkv_rotation(key)
         value = self._apply_shared_qkv_rotation(value)
 
-        query = self.q_norm(query) * (self.scaling * (self.head_dim ** -0.5))
-        key = self.k_norm(key) * (self.scaling * (self.head_dim ** -0.5))
+        query = self.q_norm(query) * self.attn_scale
+        key = self.k_norm(key) * self.attn_scale
         value = self.v_norm(value)
 
         if self.rotary_emb is not None:
@@ -174,7 +178,7 @@ class Gemma4FlashAttention2(Gemma4Attention):
         attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
         attn_output = torch.matmul(attn_weights, value)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.hidden_size)
-        attn_output = self.o_proj(attn_output, R1, R2=self.R2.weight, transpose=True)
+        attn_output = self.o_proj(attn_output, R1, R2=r2_weight, transpose=True)
 
         outputs = (attn_output,)
         if output_attentions:
