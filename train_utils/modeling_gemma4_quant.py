@@ -1,4 +1,7 @@
+import math
+from typing import Optional
 
+import torch
 import torch.nn as nn
 from train_utils.quant_linear import QuantizeLinear
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
@@ -43,7 +46,7 @@ class Gemma4Attention(nn.Module):
         # Q/K norms with learnable weights handle scaling implicitly.
         self.scaling = 1.0
 
-         self.q_proj = QuantizeLinear(
+        self.q_proj = QuantizeLinear(
             self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
         )
         self.k_proj = QuantizeLinear(
@@ -121,4 +124,60 @@ class Gemma4Attention(nn.Module):
 
 # TODO implement Gemma4FlashAttention2, notice that the attention pattern is different from Gemma2/3, we need to apply the rotation after the q/k/v projections and before the attention computation, and we need to use the same rotation for q/k/v in the same layer. We can also share the rotation matrices across layers to save memory, but we will implement it with separate rotation matrices for each layer first.
 class Gemma4FlashAttention2(Gemma4Attention):
-    
+    def __init__(self, config: Gemma4Config, layer_idx: Optional[int] = None):
+        super().__init__(config=config, layer_idx=layer_idx)
+        # Per-layer rotation (can be shared across layers in future optimization).
+        self.qkv_rotation = nn.Parameter(
+            torch.eye(self.head_dim, dtype=torch.float32),
+            requires_grad=False,
+        )
+
+    def _apply_shared_qkv_rotation(self, states: torch.Tensor) -> torch.Tensor:
+        rotation = self.qkv_rotation.to(device=states.device, dtype=states.dtype)
+        return torch.matmul(states, rotation)
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        R1=None,
+    ):
+        batch_size, seq_length, _ = hidden_states.size()
+
+        query = self.q_proj(hidden_states, R1)
+        key = self.k_proj(hidden_states, R1)
+        value = self.v_proj(hidden_states, R1, R2=self.R2.weight)
+
+        query = query.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        key = key.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value = value.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # Gemma4-specific pattern: rotate after q/k/v projections and before attention.
+        query = self._apply_shared_qkv_rotation(query)
+        key = self._apply_shared_qkv_rotation(key)
+        value = self._apply_shared_qkv_rotation(value)
+
+        query = self.q_norm(query) * (self.scaling * (self.head_dim ** -0.5))
+        key = self.k_norm(key) * (self.scaling * (self.head_dim ** -0.5))
+        value = self.v_norm(value)
+
+        if self.rotary_emb is not None:
+            query = self.rotary_emb(query, seq_len=seq_length)
+            key = self.rotary_emb(key, seq_len=seq_length)
+
+        attn_weights = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = torch.nn.Softmax(dim=-1)(attn_weights)
+        attn_output = torch.matmul(attn_weights, value)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.hidden_size)
+        attn_output = self.o_proj(attn_output, R1, R2=self.R2.weight, transpose=True)
+
+        outputs = (attn_output,)
+        if output_attentions:
+            outputs += (attn_weights,)
+        return outputs
