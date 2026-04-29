@@ -50,8 +50,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from eval_utils.modeling_llama import LlamaForCausalLM
 from utils.fuse_norm_utils import fuse_layer_norms
 from utils.hadamard_utils import apply_exact_had_to_linear
-from utils import data_utils, eval_utils
-
+from utils import data_utils
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -108,13 +107,17 @@ def rotate_mlp_input(layer, R1: torch.Tensor) -> None:
 
 
 def rotate_mlp_output(layer, R1: torch.Tensor) -> None:
-    """down_proj.weight = R1.T @ down_proj.weight，并在 last dim 施加固定 Hadamard (R4)"""
+    """down_proj.weight = R1.T @ down_proj.weight
+    
+    注意：eval/ptq 路径还会同时设置 ActQuantWrapper.online_full_had=True，
+    将 Hadamard (R4) 分成"权重侧静态 H"和"激活侧在线 H"两半，两者相消。
+    因此在 bf16 全精度导出（无在线 H）时，不能对权重施加 H，否则 H 无法抵消，
+    导致推理结果错误（PPL 爆炸）。只需将 R1.T 融合进权重即可。
+    """
     W = layer.mlp.down_proj
     dtype = W.weight.data.dtype
     W_ = W.weight.data.to(device="cuda", dtype=torch.float64)
     W.weight.data = torch.matmul(R1.T, W_).to(device="cpu", dtype=dtype)
-    # R4: 在 down_proj 输入维（weight 的最后一维）施加精确 Hadamard
-    apply_exact_had_to_linear(W, had_dim=-1, output=False)
     if W.bias is not None:
         b = W.bias.data.to(device="cuda", dtype=torch.float64)
         W.bias.data = torch.matmul(R1.T, b).to(device="cpu", dtype=dtype)
@@ -186,25 +189,45 @@ def fuse_rotations_into_weights(model, rotation_path: str) -> None:
 @torch.inference_mode()
 def evaluate_ppl(model, tokenizer, seqlen: int = 2048, device: str = "cuda") -> float:
     """
-    在 wikitext-2 测试集上计算 PPL，复用仓库已有的 evaluator。
+    在 wikitext-2 测试集上计算 PPL。
+    显存充足时直接整体推理（无需逐层卸载），实现简单且速度快。
     """
+    log.info("Loading wikitext-2 test set...")
     testloader = data_utils.get_wikitext2(
         seed=0,
         seqlen=seqlen,
         tokenizer=tokenizer,
         eval_mode=True,
     )
+
     model.eval()
     model.to(device)
-    model.seqlen = seqlen
     model.config.use_cache = False
 
-    # 构造一个最小 args namespace
-    class _Args:
-        bsz = 1
+    input_ids = testloader.input_ids  # (1, total_len)
+    nsamples = input_ids.numel() // seqlen
+    # 截断到整数倍
+    input_ids = input_ids[:, : nsamples * seqlen].view(nsamples, seqlen)
 
-    dataset_ppl = eval_utils.evaluator(model, testloader, device, _Args())
-    return dataset_ppl
+    loss_fct = torch.nn.CrossEntropyLoss()
+    nlls = []
+
+    for i in tqdm.tqdm(range(nsamples), desc="Evaluating PPL"):
+        batch = input_ids[i : i + 1].to(device)   # (1, seqlen)
+        with torch.no_grad():
+            logits = model(batch).logits            # (1, seqlen, vocab)
+        # shift：用前 seqlen-1 个 token 预测后 seqlen-1 个
+        shift_logits = logits[:, :-1, :].contiguous().float()  # (1, seqlen-1, vocab)
+        shift_labels = batch[:, 1:].contiguous()               # (1, seqlen-1)
+        loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        )
+        nlls.append(loss.item())
+
+    ppl = math.exp(sum(nlls) / len(nlls))
+    log.info(f"WikiText-2 PPL: {ppl:.4f}")
+    return ppl
 
 
 # ---------------------------------------------------------------------------
