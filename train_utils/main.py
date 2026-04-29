@@ -81,6 +81,7 @@ def prepare_model(args, model):
                 groupsize=layer_groupsize,
                 sym=layer_a_sym,
                 clip_ratio=layer_a_clip,
+                sefp=True,
             )
 
     if args.k_bits < 16:

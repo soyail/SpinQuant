@@ -23,7 +23,7 @@ torchrun --nnodes=1 --nproc_per_node=8 optimize_rotation.py \
 --lr_scheduler_type "cosine" \
 --gradient_checkpointing True \
 --save_safetensors False \
---max_steps 100 \
+--max_steps 10 \
 --w_bits $2 \
 --a_bits $3 \
 --k_bits $4 \
@@ -32,5 +32,7 @@ torchrun --nnodes=1 --nproc_per_node=8 optimize_rotation.py \
 --a_asym \
 --k_asym \
 --v_asym \
+--a_groupsize 64 \
+--w_groupsize 64 \
 --k_groupsize 128 \
 --v_groupsize 128 \
