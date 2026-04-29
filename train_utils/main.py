@@ -10,7 +10,7 @@
 
 import transformers
 
-from train_utils import apply_r3_r4, rtn_utils
+from train_utils import apply_r3_r4, rtn_utils, ssfp_utils
 from utils import fuse_norm_utils, hadamard_utils, quant_utils, utils
 
 
@@ -34,7 +34,8 @@ def prepare_model(args, model):
             qlayers[name].fp32_had = args.fp32_had
 
     if args.w_bits < 16:
-        quantizers = rtn_utils.rtn_fwrd(model, "cuda", args)
+        #quantizers = rtn_utils.rtn_fwrd(model, "cuda", args)
+        quantizers = ssfp_utils.ssfp_fwrd(model, "cuda", args)
 
     # Add Input Quantization
     if args.a_bits < 16 or args.v_bits < 16:

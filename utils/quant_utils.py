@@ -58,6 +58,45 @@ def sym_quant_dequant(x, scale, maxq):
     return sym_dequant(*sym_quant(x, scale, maxq))
 
 
+def sefp_scale_quant(scale):
+    scale_dtype = scale.dtype
+    scale = scale.float().clamp(min=1e-5)
+    scale_exp = torch.ceil(torch.log2(scale)).clamp(min=-15, max=15)
+    return torch.exp2(scale_exp).to(scale_dtype)
+
+
+def sefp_quant(x, scale, maxq):
+    return sym_quant(x, scale, maxq)
+
+
+def sefp_dequant(q, scale):
+    return sym_dequant(q, scale)
+
+
+def sefp_quant_dequant(x, scale, maxq):
+    return sefp_dequant(*sefp_quant(x, scale, maxq))
+
+
+def sefp_find_scale(x, groupsize, maxq):
+    init_shape = x.shape
+    x_flat = x.reshape(-1)
+    pad_len = (groupsize - (x_flat.numel() % groupsize)) % groupsize
+    if pad_len > 0:
+        x_flat = torch.cat(
+            [x_flat, torch.zeros(pad_len, device=x.device, dtype=x.dtype)], dim=0
+        )
+
+    x_blocks = x_flat.reshape(-1, groupsize)
+    scale = x_blocks.abs().amax(dim=1, keepdim=True) / maxq
+    scale = sefp_scale_quant(scale)
+    scale[scale == 0] = 1
+
+    scale = scale.repeat(1, groupsize).reshape(-1)
+    if pad_len > 0:
+        scale = scale[:-pad_len]
+    return scale.reshape(init_shape)
+
+
 class STEQuantize(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, scale, maxq):
@@ -96,6 +135,10 @@ class ActQuantizer(torch.nn.Module):
         self.register_buffer("scale", torch.zeros(1))
         self.register_buffer("zero", torch.zeros(1))
         self.bits = 16
+        self.sym = False
+        self.groupsize = -1
+        self.clip_ratio = 1.0
+        self.sefp = False
 
     def free(self) -> None:
         self.zero = None
@@ -105,25 +148,39 @@ class ActQuantizer(torch.nn.Module):
         x_dtype = x.dtype
         if self.bits == 16:
             return x
+        elif self.sefp:
+            return STEQuantize.apply(x, self.scale, self.maxq).to(x_dtype)
         elif self.sym:
             return STEQuantize.apply(x, self.scale, self.maxq).to(x_dtype)
         return AsymSTEQuantize.apply(x, self.scale, self.zero, self.maxq).to(x_dtype)
 
     # Different from `forward`, this method returns quantized integers, scales (and zeros if asymmetric).
     def quantize(self, x):
+        if self.sefp:
+            return sefp_quant(x, self.scale, self.maxq)
         if self.sym:
             return sym_quant(x, self.scale, self.maxq)
         else:
             return asym_quant(x, self.scale, self.zero, self.maxq)
 
     def configure(
-        self, bits: int, groupsize: int = -1, sym: bool = False, clip_ratio: float = 1.0
+        self,
+        bits: int,
+        groupsize: int = -1,
+        sym: bool = False,
+        clip_ratio: float = 1.0,
+        sefp: bool = False,
     ) -> None:
+        if sefp:
+            assert sym, "SEFP only supports symmetric activation quantization"
+            if groupsize <= 0:
+                groupsize = 64
         _, self.maxq = get_minq_maxq(bits, sym)
         self.bits = bits
         self.groupsize = groupsize
         self.sym = sym
         self.clip_ratio = clip_ratio
+        self.sefp = sefp
         assert (
             self.clip_ratio <= 1 and self.clip_ratio > 0
         ), "Clip ratio should be in (0, 1]"
@@ -140,6 +197,8 @@ class ActQuantizer(torch.nn.Module):
             xmax = torch.maximum(torch.abs(xmin), xmax)
             tmp = xmax == 0
             self.scale = xmax / self.maxq
+            if self.sefp:
+                self.scale = sefp_scale_quant(self.scale)
             self.scale[tmp] = 1
             self.zero = torch.zeros_like(self.scale)
         else:
@@ -159,6 +218,11 @@ class ActQuantizer(torch.nn.Module):
         dev = x.device
         self.maxq = self.maxq.to(dev)
 
+        if self.sefp:
+            self.scale = sefp_find_scale(x * self.clip_ratio, self.groupsize, self.maxq)
+            self.zero = torch.zeros_like(self.scale)
+            return
+
         init_shape = x.shape
 
         if self.groupsize > 0:
@@ -176,6 +240,8 @@ class ActQuantizer(torch.nn.Module):
             xmax = torch.maximum(torch.abs(xmin), xmax)
             tmp = xmax == 0
             self.scale = (xmax / self.maxq).unsqueeze(1).repeat(1, reshaped_x.shape[-1])
+            if self.sefp:
+                self.scale = sefp_scale_quant(self.scale)
             self.scale[tmp] = 1
             self.scale = self.scale.reshape(init_shape)
             self.zero = torch.zeros_like(self.scale)
@@ -226,19 +292,25 @@ class ActQuantWrapper(torch.nn.Module):
     def extra_repr(self) -> str:
         str_ = f"Input Quantizer Bits: {self.quantizer.bits}"
         if self.quantizer.bits < 16:
-            str_ += (
-                f" (Asymmetric Per-Token)"
-                if not self.quantizer.sym
-                else f" (Symmetric Per-Token)"
-            )
+            if self.quantizer.sefp:
+                str_ += f" (SEFP Per-Token)"
+            else:
+                str_ += (
+                    f" (Asymmetric Per-Token)"
+                    if not self.quantizer.sym
+                    else f" (Symmetric Per-Token)"
+                )
 
         str_ += f"\nOutput Quantizer Bits: {self.out_quantizer.bits}"
         if self.out_quantizer.bits < 16:
-            str_ += (
-                f" (Asymmetric Per-Token)"
-                if not self.out_quantizer.sym
-                else f" (Symmetric Per-Token)"
-            )
+            if self.out_quantizer.sefp:
+                str_ += f" (SEFP Per-Token)"
+            else:
+                str_ += (
+                    f" (Asymmetric Per-Token)"
+                    if not self.out_quantizer.sym
+                    else f" (Symmetric Per-Token)"
+                )
 
         return str_
 
